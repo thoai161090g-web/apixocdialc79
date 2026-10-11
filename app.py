@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, jsonify, request
+from Flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -18,7 +18,7 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "500"))
 _cache = {"at": 0.0, "data": None, "error": None}
 _cache_lock = threading.Lock()
 
-# Quy ước hiển thị chuẩn theo yêu cầu của bạn
+# Quy ước hiển thị chi tiết theo yêu cầu
 DETAIL_LABELS = {
     0: "4 Trắng (0 Đỏ)",
     1: "3 Trắng 1 Đỏ",
@@ -144,45 +144,63 @@ def fetch_history(force=False):
         return [], f"Lỗi đọc API nguồn: {type(exc).__name__}"
 
 
-def dice_transition_analysis(history):
+def pattern_matching_50_analysis(history):
     """
-    Soi cầu chuẩn xác theo lịch sử tuần tự:
-    history trả về từ API là danh sách [Mới nhất, Cũ hơn, Cũ nhất,...]
-    Đảo ngược lại thành [Cũ nhất, ..., Cũ hơn, Mới nhất] để duyệt theo dòng thời gian tăng dần của phiên.
+    Lấy chuỗi khung 50 phiên gần nhất, quét toàn bộ lịch sử để tìm các đoạn khớp
+    và thống kê phiên ngay sau đó ra kết quả gì.
     """
-    chronological = list(reversed(history))
+    chronological = list(reversed(history))  # Từ cũ nhất đến mới nhất
     
-    # transitions[ket_qua_hien_tai][ket_qua_phien_sau] = số lần xuất hiện
-    transitions = defaultdict(Counter)
+    window_len = 50
+    if len(chronological) <= window_len:
+        window_len = max(5, len(chronological) - 1)
+
+    if window_len < 2:
+        return {
+            "prediction": None,
+            "sample_size": len(chronological),
+            "history_matched_count": 0,
+        }
+
+    # Lấy khung 50 phiên mới nhất
+    current_pattern = tuple(row.get("red_count") for row in chronological[-window_len:] if row.get("red_count") is not None)
+    
+    next_outcomes_counter = Counter()
     overall_counts = Counter()
-
-    for i in range(len(chronological) - 1):
-        curr_code = chronological[i].get("red_count")
-        next_code = chronological[i+1].get("red_count")
+    
+    for i in range(len(chronological) - window_len):
+        historical_segment = tuple(chronological[i + j].get("red_count") for j in range(window_len))
+        next_code = chronological[i + window_len].get("red_count")
         
-        if curr_code is not None and next_code is not None:
-            transitions[curr_code][next_code] += 1
+        if next_code is not None:
             overall_counts[next_code] += 1
+            if historical_segment == current_pattern:
+                next_outcomes_counter[next_code] += 1
 
-    # Lấy kết quả của phiên MỚI NHẤT hiện tại
-    latest_row = history[0] if history else {}
-    latest_code = latest_row.get("red_count")
-
-    # Dò xem sau con số của phiên hiện tại, lịch sử đã từng ra những con số nào ở phiên kế tiếp
-    target_transitions = transitions[latest_code] if latest_code is not None else Counter()
-    total_matched = sum(target_transitions.values())
+    total_matched = sum(next_outcomes_counter.values())
+    
+    # Cơ chế dự phòng (Backoff): Nếu khung 50 phiên dài quá chưa khớp thì thu ngắn lại dần (30, 20, 10)
+    effective_window = window_len
+    while total_matched == 0 and effective_window > 5:
+        effective_window -= 10
+        current_pattern = current_pattern[-effective_window:]
+        next_outcomes_counter.clear()
+        
+        for i in range(len(chronological) - effective_window):
+            historical_segment = tuple(chronological[i + j].get("red_count") for j in range(effective_window))
+            next_code = chronological[i + effective_window].get("red_count")
+            if historical_segment == current_pattern and next_code is not None:
+                next_outcomes_counter[next_code] += 1
+        total_matched = sum(next_outcomes_counter.values())
 
     distribution = []
-    
-    # Nếu lịch sử của trạng thái này chưa có nhiều, kết hợp thêm tần suất chung để không bị lỗi trống
+    total_overall = sum(overall_counts.values())
+
     for code in range(5):
-        count_in_pattern = target_transitions[code]
-        # Tính điểm dựa trên số lần thực tế xuất hiện sau trạng thái này trong lịch sử
+        matched_count = next_outcomes_counter[code]
         if total_matched > 0:
-            score = count_in_pattern / total_matched
+            score = matched_count / total_matched
         else:
-            # Fallback nếu trạng thái này chưa từng xuất hiện trước đó: dùng tần suất tổng thể
-            total_overall = sum(overall_counts.values())
             score = (overall_counts[code] + 1) / (total_overall + 5) if total_overall > 0 else 0.2
 
         distribution.append({
@@ -190,18 +208,16 @@ def dice_transition_analysis(history):
             "white_count": 4 - code,
             "label": DETAIL_LABELS[code],
             "parity": "CHẴN" if code in (0, 2, 4) else "LẺ",
-            "history_matched_count": count_in_pattern,
+            "history_matched_count": matched_count,
             "model_score": round(score, 4),
             "estimated_percent": round(score * 100, 2)
         })
 
-    # Sắp xếp kết quả có tỉ lệ xuất hiện sau trạng thái này cao nhất lên đầu
     sorted_dist = sorted(distribution, key=lambda x: (x["history_matched_count"], x["model_score"]), reverse=True)
     best = sorted_dist[0]
 
     return {
-        "latest_code": latest_code,
-        "latest_label": DETAIL_LABELS.get(latest_code, "Không rõ") if latest_code is not None else None,
+        "pattern_length_used": effective_window,
         "prediction": best,
         "distribution": sorted_dist,
         "sample_size": len(chronological),
@@ -212,7 +228,7 @@ def dice_transition_analysis(history):
 @app.get("/")
 def index():
     return jsonify({
-        "name": "Xoc Dia True History Pattern API",
+        "name": "Xoc Dia Pattern Matching API",
         "status": "online",
         "endpoint": "/api/xocdia"
     })
@@ -229,7 +245,7 @@ def api_xocdia():
     if not history:
         return jsonify({"error": error or "Không có dữ liệu", "source_ok": False}), 502
 
-    analysis = dice_transition_analysis(history)
+    analysis = pattern_matching_50_analysis(history)
     latest = history[0]
     latest_id_num = safe_int(latest.get("id"))
     next_session = str(latest_id_num + 1) if latest_id_num is not None else None
@@ -238,13 +254,14 @@ def api_xocdia():
 
     response = {
         "phien_hien_tai": str(latest.get("id")),
-        "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"), # Ví dụ: 4 Trắng (0 Đỏ) hoặc 2 Trắng 2 Đỏ
+        "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"),
+        "khung_soi_cau": f"Đã gom khung {analysis.get('pattern_length_used', 50)} phiên gần nhất để quét lịch sử",
         "phien_du_doan": next_session,
-        "du_doan_chan_le": best_pred.get("parity"),
-        "du_doan_chi_tiet": best_pred.get("label"),        # Soi ra con số tiếp theo sau kết quả hiện tại
+        "dự_đoán_chẵn_lẻ": best_pred.get("parity"),
+        "dự_đoán_chi_tiet": best_pred.get("label"),
         "so_do": best_pred.get("red_count"),
         "so_trang": best_pred.get("white_count"),
-        "so_lan_xuat_hien_trong_lich_su": analysis.get("history_matched_count"),
+        "so_lan_khop_khung_trong_lich_su": analysis.get("history_matched_count"),
         "source_ok": error is None
     }
     
@@ -260,13 +277,12 @@ def api_predict():
     if not history:
         return jsonify({"error": error or "Không có dữ liệu", "source_ok": False}), 502
     
-    analysis = dice_transition_analysis(history)
+    analysis = pattern_matching_50_analysis(history)
     latest = history[0] if history else {}
     
     return jsonify({
         "phien_hien_tai": latest.get("id"),
-        "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"),
-        "soi_cau_lich_su": analysis,
+        "chi_tiet_phan_tich": analysis,
         "source_ok": error is None
     })
 
