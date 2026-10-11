@@ -1,5 +1,4 @@
 import os
-import math
 import time
 import threading
 from collections import Counter, defaultdict
@@ -19,8 +18,9 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "500"))
 _cache = {"at": 0.0, "data": None, "error": None}
 _cache_lock = threading.Lock()
 
+# Quy ước hiển thị chuẩn theo yêu cầu của bạn
 DETAIL_LABELS = {
-    0: "4 Trắng",
+    0: "4 Trắng (0 Đỏ)",
     1: "3 Trắng 1 Đỏ",
     2: "2 Trắng 2 Đỏ",
     3: "3 Đỏ 1 Trắng",
@@ -83,20 +83,22 @@ def parse_item(item):
             "three_do": 3,
             "four_do": 4,
         }
-    
         number_red = label_map.get(result_vi)
         if number_red is not None:
             parity = "CHAN" if number_red % 2 == 0 else "LE"
 
-    if parity is None:
+    if number_red is None or not (0 <= number_red <= 4):
         return None
+
+    if parity is None:
+        parity = "CHAN" if number_red % 2 == 0 else "LE"
 
     return {
         "id": str(item.get("id", "")),
         "parity": parity,
         "parity_vi": "Chẵn" if parity == "CHAN" else "Lẻ",
         "red_count": number_red,
-        "white_count": whites if whites is not None else (4 - number_red if number_red is not None else None),
+        "white_count": 4 - number_red,
         "chi_tiet_ket_qua": DETAIL_LABELS.get(number_red, "Không xác định"),
         "resultVi": item.get("resultVi"),
         "dices": dices if isinstance(dices, list) else None,
@@ -144,13 +146,13 @@ def fetch_history(force=False):
 
 def dice_transition_analysis(history):
     """
-    Dò lại lịch sử theo dạng: Sau kết quả X thì phiên tiếp theo ra kết quả Y.
-    history truyền vào theo thứ tự từ mới nhất -> cũ nhất.
-    Đảo ngược lại thành cũ nhất -> mới nhất để duyệt chuỗi thời gian tuyến tính.
+    Soi cầu chuẩn xác theo lịch sử tuần tự:
+    history trả về từ API là danh sách [Mới nhất, Cũ hơn, Cũ nhất,...]
+    Đảo ngược lại thành [Cũ nhất, ..., Cũ hơn, Mới nhất] để duyệt theo dòng thời gian tăng dần của phiên.
     """
     chronological = list(reversed(history))
     
-    # Ma trận chuyển tiếp: transitions[current_red_count][next_red_count] = số lần xuất hiện
+    # transitions[ket_qua_hien_tai][ket_qua_phien_sau] = số lần xuất hiện
     transitions = defaultdict(Counter)
     overall_counts = Counter()
 
@@ -158,40 +160,43 @@ def dice_transition_analysis(history):
         curr_code = chronological[i].get("red_count")
         next_code = chronological[i+1].get("red_count")
         
-        if curr_code is not None and 0 <= curr_code <= 4 and next_code is not None and 0 <= next_code <= 4:
+        if curr_code is not None and next_code is not None:
             transitions[curr_code][next_code] += 1
             overall_counts[next_code] += 1
 
-    # Lấy kết quả của phiên mới nhất (hiện tại)
+    # Lấy kết quả của phiên MỚI NHẤT hiện tại
     latest_row = history[0] if history else {}
     latest_code = latest_row.get("red_count")
 
-    # Thống kê xác suất sau khi ra kết quả của phiên hiện tại
-    target_transitions = transitions[latest_code] if latest_code is not None in transitions else Counter()
-    total_matches = sum(target_transitions.values())
+    # Dò xem sau con số của phiên hiện tại, lịch sử đã từng ra những con số nào ở phiên kế tiếp
+    target_transitions = transitions[latest_code] if latest_code is not None else Counter()
+    total_matched = sum(target_transitions.values())
 
-    # Làm trơn (Laplace smoothing) để tránh trường hợp chưa từng xuất hiện mà bị về 0
-    alpha = 1.0
     distribution = []
     
+    # Nếu lịch sử của trạng thái này chưa có nhiều, kết hợp thêm tần suất chung để không bị lỗi trống
     for code in range(5):
-        # Nếu lịch sử có dò thấy trạng thái hiện tại, ưu tiên dùng transition, nếu ít quá thì pha thêm tỷ lệ tổng thể
-        matched_count = target_transitions[code]
-        # Điểm số kết hợp giữa: Xu hướng sau kết quả này + Xu hướng chung gần đây
-        score = (matched_count + alpha) / (total_matches + 5 * alpha)
-        
+        count_in_pattern = target_transitions[code]
+        # Tính điểm dựa trên số lần thực tế xuất hiện sau trạng thái này trong lịch sử
+        if total_matched > 0:
+            score = count_in_pattern / total_matched
+        else:
+            # Fallback nếu trạng thái này chưa từng xuất hiện trước đó: dùng tần suất tổng thể
+            total_overall = sum(overall_counts.values())
+            score = (overall_counts[code] + 1) / (total_overall + 5) if total_overall > 0 else 0.2
+
         distribution.append({
             "red_count": code,
             "white_count": 4 - code,
             "label": DETAIL_LABELS[code],
             "parity": "CHẴN" if code in (0, 2, 4) else "LẺ",
-            "matched_history_count": matched_count,
+            "history_matched_count": count_in_pattern,
             "model_score": round(score, 4),
             "estimated_percent": round(score * 100, 2)
         })
 
-    # Sắp xếp kết quả có điểm cao nhất lên đầu
-    sorted_dist = sorted(distribution, key=lambda x: x["model_score"], reverse=True)
+    # Sắp xếp kết quả có tỉ lệ xuất hiện sau trạng thái này cao nhất lên đầu
+    sorted_dist = sorted(distribution, key=lambda x: (x["history_matched_count"], x["model_score"]), reverse=True)
     best = sorted_dist[0]
 
     return {
@@ -200,14 +205,14 @@ def dice_transition_analysis(history):
         "prediction": best,
         "distribution": sorted_dist,
         "sample_size": len(chronological),
-        "history_matched_count": total_matches
+        "history_matched_count": total_matched
     }
 
 
 @app.get("/")
 def index():
     return jsonify({
-        "name": "Xoc Dia Transition Prediction API",
+        "name": "Xoc Dia True History Pattern API",
         "status": "online",
         "endpoint": "/api/xocdia"
     })
@@ -232,15 +237,14 @@ def api_xocdia():
     best_pred = analysis.get("prediction", {})
 
     response = {
-        "phien": str(latest.get("id")),
-        "ket_qua": latest.get("parity_vi"),
-        "chi_tiet_ket_qua": latest.get("chi_tiet_ket_qua"), # Ví dụ: 2 Trắng 2 Đỏ
-        "du_doan_phien": next_session,
-        "dự_đoán_chẵn_lẻ": best_pred.get("parity"),
-        "dự_đoán_chi_tiet": best_pred.get("label"),        # Dự đoán phiên sau ra gì (VD: 3 Đỏ 1 Trắng)
+        "phien_hien_tai": str(latest.get("id")),
+        "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"), # Ví dụ: 4 Trắng (0 Đỏ) hoặc 2 Trắng 2 Đỏ
+        "phien_du_doan": next_session,
+        "du_doan_chan_le": best_pred.get("parity"),
+        "du_doan_chi_tiet": best_pred.get("label"),        # Soi ra con số tiếp theo sau kết quả hiện tại
         "so_do": best_pred.get("red_count"),
         "so_trang": best_pred.get("white_count"),
-        "so_lan_lap_lai_trong_lich_su": analysis.get("history_matched_count"),
+        "so_lan_xuat_hien_trong_lich_su": analysis.get("history_matched_count"),
         "source_ok": error is None
     }
     
@@ -262,7 +266,7 @@ def api_predict():
     return jsonify({
         "phien_hien_tai": latest.get("id"),
         "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"),
-        "phan_tich_chuyen_tiep": analysis,
+        "soi_cau_lich_su": analysis,
         "source_ok": error is None
     })
 
