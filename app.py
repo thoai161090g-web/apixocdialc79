@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import requests
-from Flask import Flask, jsonify, request
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -145,9 +145,12 @@ def fetch_history(force=False):
 
 
 def pattern_matching_50_analysis(history):
-    chronological = list(reversed(history))  # Cũ nhất -> Mới nhất
+    """
+    Gom đúng khung 50 phiên gần nhất làm mẫu, quét toàn bộ lịch sử
+    để tìm xem đoạn khung này xuất hiện ở đâu và phiên kế tiếp ra gì.
+    """
+    chronological = list(reversed(history))  # Từ cũ nhất đến mới nhất
     
-    # Bắt buộc lấy đúng 50 phiên gần nhất (hoặc ít hơn nếu lịch sử không đủ 50 phiên)
     window_len = 50
     if len(chronological) <= window_len:
         window_len = max(5, len(chronological) - 1)
@@ -157,12 +160,12 @@ def pattern_matching_50_analysis(history):
             "prediction": None,
             "sample_size": len(chronological),
             "history_matched_count": 0,
+            "pattern_length_used": window_len
         }
 
     # Lấy đúng chuỗi 50 phiên mới nhất làm khung soi cầu
     current_pattern = tuple(row.get("red_count") for row in chronological[-window_len:] if row.get("red_count") is not None)
     
-    # Quét toàn bộ lịch sử để tìm xem khung 50 phiên này khớp ở những đoạn nào và ván sau đó ra gì
     next_outcomes_counter = Counter()
     overall_counts = Counter()
     
@@ -185,7 +188,7 @@ def pattern_matching_50_analysis(history):
         if total_matched > 0:
             score = matched_count / total_matched
         else:
-            # Nếu khung 50 phiên này quá mới chưa từng lặp lại y hệt, dùng tần suất của các ván cuối trong khung đó để dự đoán
+            # Nếu khung 50 phiên này chưa từng lặp lại y hệt, dùng tần suất chung có làm trơn
             score = (overall_counts[code] + 1) / (total_overall + 5) if total_overall > 0 else 0.2
 
         distribution.append({
@@ -202,7 +205,7 @@ def pattern_matching_50_analysis(history):
     best = sorted_dist[0]
 
     return {
-        "pattern_length_used": window_len, # Cố định đúng khung số phiên yêu cầu
+        "pattern_length_used": window_len,
         "prediction": best,
         "distribution": sorted_dist,
         "sample_size": len(chronological),
@@ -240,7 +243,7 @@ def api_xocdia():
     response = {
         "phien_hien_tai": str(latest.get("id")),
         "ket_qua_hien_tai": latest.get("chi_tiet_ket_qua"),
-        "khung_soi_cau": f"Đã gom khung {analysis.get('pattern_length_used', 50)} phiên gần nhất để quét lịch sử",
+        "khung_soi_cau": f"Gom chuẩn khung {analysis.get('pattern_length_used', 50)} phiên gần nhất quét lịch sử",
         "phien_du_doan": next_session,
         "dự_đoán_chẵn_lẻ": best_pred.get("parity"),
         "dự_đoán_chi_tiet": best_pred.get("label"),
