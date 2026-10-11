@@ -145,12 +145,9 @@ def fetch_history(force=False):
 
 
 def pattern_matching_50_analysis(history):
-    """
-    Lấy chuỗi khung 50 phiên gần nhất, quét toàn bộ lịch sử để tìm các đoạn khớp
-    và thống kê phiên ngay sau đó ra kết quả gì.
-    """
-    chronological = list(reversed(history))  # Từ cũ nhất đến mới nhất
+    chronological = list(reversed(history))  # Cũ nhất -> Mới nhất
     
+    # Bắt buộc lấy đúng 50 phiên gần nhất (hoặc ít hơn nếu lịch sử không đủ 50 phiên)
     window_len = 50
     if len(chronological) <= window_len:
         window_len = max(5, len(chronological) - 1)
@@ -162,9 +159,10 @@ def pattern_matching_50_analysis(history):
             "history_matched_count": 0,
         }
 
-    # Lấy khung 50 phiên mới nhất
+    # Lấy đúng chuỗi 50 phiên mới nhất làm khung soi cầu
     current_pattern = tuple(row.get("red_count") for row in chronological[-window_len:] if row.get("red_count") is not None)
     
+    # Quét toàn bộ lịch sử để tìm xem khung 50 phiên này khớp ở những đoạn nào và ván sau đó ra gì
     next_outcomes_counter = Counter()
     overall_counts = Counter()
     
@@ -178,20 +176,6 @@ def pattern_matching_50_analysis(history):
                 next_outcomes_counter[next_code] += 1
 
     total_matched = sum(next_outcomes_counter.values())
-    
-    # Cơ chế dự phòng (Backoff): Nếu khung 50 phiên dài quá chưa khớp thì thu ngắn lại dần (30, 20, 10)
-    effective_window = window_len
-    while total_matched == 0 and effective_window > 5:
-        effective_window -= 10
-        current_pattern = current_pattern[-effective_window:]
-        next_outcomes_counter.clear()
-        
-        for i in range(len(chronological) - effective_window):
-            historical_segment = tuple(chronological[i + j].get("red_count") for j in range(effective_window))
-            next_code = chronological[i + effective_window].get("red_count")
-            if historical_segment == current_pattern and next_code is not None:
-                next_outcomes_counter[next_code] += 1
-        total_matched = sum(next_outcomes_counter.values())
 
     distribution = []
     total_overall = sum(overall_counts.values())
@@ -201,6 +185,7 @@ def pattern_matching_50_analysis(history):
         if total_matched > 0:
             score = matched_count / total_matched
         else:
+            # Nếu khung 50 phiên này quá mới chưa từng lặp lại y hệt, dùng tần suất của các ván cuối trong khung đó để dự đoán
             score = (overall_counts[code] + 1) / (total_overall + 5) if total_overall > 0 else 0.2
 
         distribution.append({
@@ -217,7 +202,7 @@ def pattern_matching_50_analysis(history):
     best = sorted_dist[0]
 
     return {
-        "pattern_length_used": effective_window,
+        "pattern_length_used": window_len, # Cố định đúng khung số phiên yêu cầu
         "prediction": best,
         "distribution": sorted_dist,
         "sample_size": len(chronological),
